@@ -19,11 +19,7 @@ class SecurityPostgresTest {
 
     @Test
     fun `postgres enforces recipe ownership and rejects expired and revoked sessions`() = testApplication {
-        val url = System.getenv("COOKBOOK_TEST_DB_URL")
-        assumeTrue("Start a disposable PostgreSQL fixture to run this test", !url.isNullOrBlank())
-        val dbUser = checkNotNull(System.getenv("COOKBOOK_TEST_DB_USER"))
-        val dbPassword = checkNotNull(System.getenv("COOKBOOK_TEST_DB_PASSWORD"))
-        val connect = { DriverManager.getConnection(url, dbUser, dbPassword) }
+        val connect = testConnection()
         application { configureCookBook(connect = connect) }
 
         val suffix = UUID.randomUUID().toString().take(8)
@@ -32,6 +28,19 @@ class SecurityPostgresTest {
         val password = "fixture-only-password"
         val ownerId = client.register("owner-$suffix", ownerEmail, password)
         val otherId = client.register("other-$suffix", otherEmail, password)
+        val duplicateEmail = client.post("/auth/register") {
+            setBody(gson.toJson(mapOf("username" to "duplicate-$suffix", "email" to ownerEmail, "password" to password)))
+        }
+        assertEquals(HttpStatusCode.Conflict, duplicateEmail.status)
+        val duplicateUsername = client.post("/auth/register") {
+            setBody(gson.toJson(mapOf("username" to "owner-$suffix", "email" to "duplicate-$suffix@example.test", "password" to password)))
+        }
+        assertEquals(HttpStatusCode.Conflict, duplicateUsername.status)
+        val wrongPassword = client.post("/auth/login") {
+            setBody(gson.toJson(mapOf("email" to ownerEmail, "password" to "another-fixture-password")))
+        }
+        assertEquals(HttpStatusCode.Unauthorized, wrongPassword.status)
+        assertFalse(JsonParser.parseString(wrongPassword.bodyAsText()).asJsonObject.has("token"))
         val owner = client.login(ownerEmail, password)
         val other = client.login(otherEmail, password)
         val me = client.get("/auth/me") { bearerAuth(owner) }
@@ -43,6 +52,16 @@ class SecurityPostgresTest {
         assertEquals(HttpStatusCode.Created, add.status)
         val id = JsonParser.parseString(add.bodyAsText()).asJsonObject["id"].asInt
         val path = "/recipes/$id"
+
+        val publicList = client.get("/recipes")
+        val ownerList = client.get("/recipes/mine") { bearerAuth(owner) }
+        val otherList = client.get("/recipes/mine") { bearerAuth(other) }
+        assertEquals(HttpStatusCode.OK, publicList.status)
+        assertEquals(HttpStatusCode.OK, ownerList.status)
+        assertEquals(HttpStatusCode.OK, otherList.status)
+        assertTrue(JsonParser.parseString(publicList.bodyAsText()).asJsonArray.any { it.asJsonObject["id"].asInt == id })
+        assertTrue(JsonParser.parseString(ownerList.bodyAsText()).asJsonArray.any { it.asJsonObject["id"].asInt == id })
+        assertTrue(JsonParser.parseString(otherList.bodyAsText()).asJsonArray.isEmpty)
 
         val rejected = client.put(path) { bearerAuth(other); setBody(recipe("Obcy tytuł")) }
         assertEquals(HttpStatusCode.NotFound, rejected.status)
@@ -93,9 +112,47 @@ class SecurityPostgresTest {
         assertEquals(HttpStatusCode.Unauthorized, client.get("/auth/me") { bearerAuth(expired) }.status)
         assertEquals(HttpStatusCode.Unauthorized, client.delete(path) { bearerAuth(expired) }.status)
         assertEquals(HttpStatusCode.OK, client.delete(path) { bearerAuth(owner) }.status)
+        assertEquals(HttpStatusCode.NotFound, client.get(path).status)
         assertEquals(HttpStatusCode.NoContent, client.post("/auth/logout") { bearerAuth(owner) }.status)
         assertEquals(HttpStatusCode.Unauthorized, client.get("/recipes/mine") { bearerAuth(owner) }.status)
         assertEquals(HttpStatusCode.OK, client.get("/auth/me") { bearerAuth(other) }.status)
+    }
+
+    @Test
+    fun `recipes and sessions survive starting a new backend instance`() {
+        val connect = testConnection()
+        val suffix = UUID.randomUUID().toString().take(8)
+        val email = "restart-$suffix@example.test"
+        val password = "fixture-only-password"
+        val title = "Przepis po restarcie $suffix"
+        lateinit var token: String
+        var path = ""
+
+        testApplication {
+            application { configureCookBook(connect = connect) }
+            client.register("restart-$suffix", email, password)
+            token = client.login(email, password)
+            val add = client.post("/recipes") { bearerAuth(token); setBody(recipe(title)) }
+            assertEquals(HttpStatusCode.Created, add.status)
+            path = "/recipes/${JsonParser.parseString(add.bodyAsText()).asJsonObject["id"].asInt}"
+        }
+
+        testApplication {
+            application { configureCookBook(connect = connect) }
+            assertEquals(HttpStatusCode.OK, client.get("/auth/me") { bearerAuth(token) }.status)
+            val saved = client.get(path)
+            assertEquals(HttpStatusCode.OK, saved.status)
+            assertEquals(title, JsonParser.parseString(saved.bodyAsText()).asJsonObject["title"].asString)
+            assertEquals(HttpStatusCode.OK, client.delete(path) { bearerAuth(token) }.status)
+        }
+    }
+
+    private fun testConnection(): () -> java.sql.Connection {
+        val url = System.getenv("COOKBOOK_TEST_DB_URL")
+        assumeTrue("Start a disposable PostgreSQL fixture to run this test", !url.isNullOrBlank())
+        val user = checkNotNull(System.getenv("COOKBOOK_TEST_DB_USER"))
+        val password = checkNotNull(System.getenv("COOKBOOK_TEST_DB_PASSWORD"))
+        return { DriverManager.getConnection(url, user, password) }
     }
 
     private suspend fun HttpClient.register(username: String, email: String, password: String): Int {
