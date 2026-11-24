@@ -1,0 +1,11 @@
+/.gradle/
+/.idea/
+/.kotlin/
+/build/
+/backups/
+.env
+.env.*
+*.dump
+*.backup
+*.p12
+*.key
